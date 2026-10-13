@@ -19,8 +19,10 @@
 #include <cups/raster.h>
 #include <jbig.h>
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,10 +33,19 @@
 
 #define EOL "\r\n"
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 /* Divisor for the DOTCOUNT value reported to the printer (toner estimate).
  * Matches the behaviour of the last maintained shell filter, which divided
  * the black-pixel count by 100. */
 #define DOTCOUNT_DIVISOR 100
+
+/* Sanity limits for raster headers. */
+#define MIN_RES 72
+#define MAX_RES 2400
+#define MAX_PAGE_PT 2016 /* 28 inches, twice US Legal */
 
 static volatile sig_atomic_t canceled = 0;
 
@@ -108,11 +119,17 @@ static void paper_name(const cups_page_header2_t *h, const char *fallback,
         }
     }
 
-    /* Unknown size: send the name upper-cased, like the old filter. */
-    size_t i;
-    for (i = 0; src && src[i] && i + 1 < outlen; i++)
-        out[i] = (src[i] >= 'a' && src[i] <= 'z') ? src[i] - 32 : src[i];
-    out[i] = '\0';
+    /* Unknown size: send the name upper-cased, like the old filter. The
+     * name comes from the job (options or raster header), so only letters,
+     * digits and a little punctuation are kept: anything else, notably CR/LF,
+     * could inject PJL commands. */
+    size_t j = 0;
+    for (size_t i = 0; src && src[i] && j + 1 < outlen; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (isalnum(c) || c == '_' || c == '.' || c == '-')
+            out[j++] = (char)toupper(c);
+    }
+    out[j] = '\0';
     if (!out[0])
         snprintf(out, outlen, "A4");
 }
@@ -138,6 +155,73 @@ static size_t count_black(const unsigned char *p, size_t n)
     for (size_t i = 0; i < n; i++)
         dots += (size_t)__builtin_popcount(p[i]);
     return dots;
+}
+
+/*
+ * Halftoning for 8-bit gray input ("Photo" mode).
+ *
+ * A clustered-dot screen at 45 degrees: the dots grow from the centre, so the
+ * printer draws a few solid dots rather than many isolated pixels, which a
+ * laser reproduces much more evenly. The screen cell is SCREEN_N pixels
+ * square and holds two dots, giving 600 / (10 / sqrt 2) = 85 lines per inch
+ * and about 50 gray levels.
+ *
+ * Toner spreads on paper, so dark grays print darker than requested; the
+ * tone curve (darkness ^ DOT_GAIN_GAMMA) lightens them to compensate.
+ */
+#define SCREEN_N 10
+#define DOT_GAIN_GAMMA 1.4
+
+static unsigned char screen[SCREEN_N][SCREEN_N];
+static unsigned char tone[256];
+
+static void halftone_init(void)
+{
+    double spot[SCREEN_N * SCREEN_N];
+    int order[SCREEN_N * SCREEN_N];
+    const int n = SCREEN_N * SCREEN_N;
+
+    for (int y = 0; y < SCREEN_N; y++) {
+        for (int x = 0; x < SCREEN_N; x++) {
+            double u = 2 * M_PI * (x + y + 1) / SCREEN_N;
+            double v = 2 * M_PI * (x - y) / SCREEN_N;
+            spot[y * SCREEN_N + x] = cos(u) + cos(v);
+            order[y * SCREEN_N + x] = y * SCREEN_N + x;
+        }
+    }
+    /* Rank pixels by spot value, highest (dot centre) first. Insertion sort
+     * is stable, so equal values keep their positional order. */
+    for (int i = 1; i < n; i++) {
+        int k = order[i], j = i - 1;
+        while (j >= 0 && spot[order[j]] < spot[k]) {
+            order[j + 1] = order[j];
+            j--;
+        }
+        order[j + 1] = k;
+    }
+    /* Thresholds stay within 1..254, so pure black and white pass through
+     * unchanged and text stays crisp. */
+    for (int r = 0; r < n; r++)
+        screen[order[r] / SCREEN_N][order[r] % SCREEN_N] =
+            (unsigned char)(1 + r * 253 / (n - 1));
+
+    for (int d = 0; d < 256; d++)
+        tone[d] = (unsigned char)(255.0 * pow(d / 255.0, DOT_GAIN_GAMMA) + 0.5);
+}
+
+/* Convert one 8-bit row to 1 bit per pixel (1 = black). (px, py) is the
+ * row's position on the page, so the screen lines up across pages. */
+static void halftone_row(const unsigned char *in, unsigned width, int black_is_255,
+                         unsigned px, unsigned py, unsigned char *out)
+{
+    const unsigned char *thr = screen[py % SCREEN_N];
+
+    memset(out, 0, (width + 7) / 8);
+    for (unsigned x = 0; x < width; x++) {
+        unsigned char d = black_is_255 ? in[x] : (unsigned char)(255 - in[x]);
+        if (tone[d] > thr[(px + x) % SCREEN_N] || d == 255)
+            out[x / 8] |= (unsigned char)(0x80 >> (x % 8));
+    }
 }
 
 static int write_all(const void *data, size_t len)
@@ -187,21 +271,43 @@ int main(int argc, char *argv[])
 
     cups_raster_t *ras = cupsRasterOpen(fd, CUPS_RASTER_READ);
     cups_page_header2_t h;
-    unsigned char *bitmap = NULL, *row = NULL;
-    size_t bitmap_cap = 0, row_cap = 0;
+    unsigned char *bitmap = NULL, *row = NULL, *bits = NULL;
+    size_t bitmap_cap = 0, row_cap = 0, bits_cap = 0;
+    int halftone_ready = 0;
     struct buf jbig = { 0 };
     int page = 0, status = 0;
 
     while (!canceled && cupsRasterReadHeader2(ras, &h)) {
-        if (h.cupsBitsPerPixel != 1) {
+        int gray = h.cupsBitsPerPixel == 8 &&
+                   (h.cupsColorSpace == CUPS_CSPACE_W || h.cupsColorSpace == CUPS_CSPACE_SW ||
+                    h.cupsColorSpace == CUPS_CSPACE_K);
+        if (h.cupsBitsPerPixel != 1 && !gray) {
             fprintf(stderr, "ERROR: Unsupported raster format (%u bits per "
-                    "pixel); the PPD must request 1-bit black output\n",
-                    h.cupsBitsPerPixel);
+                    "pixel, color space %u); the PPD must request 1-bit or "
+                    "8-bit gray output\n", h.cupsBitsPerPixel, h.cupsColorSpace);
             status = 1;
             break;
         }
+        if (gray && !halftone_ready) {
+            halftone_init();
+            halftone_ready = 1;
+        }
         if (h.cupsWidth == 0 || h.cupsHeight == 0)
             continue;
+
+        /* The raster can come straight from a user (CUPS accepts raw
+         * raster jobs), so never trust its geometry. */
+        unsigned xres = h.HWResolution[0], yres = h.HWResolution[1];
+        if (xres < MIN_RES || xres > MAX_RES || yres < MIN_RES || yres > MAX_RES ||
+            h.cupsWidth > MAX_PAGE_PT * xres / 72 ||
+            h.cupsHeight > MAX_PAGE_PT * yres / 72 ||
+            h.cupsBytesPerLine != (h.cupsWidth * h.cupsBitsPerPixel + 7) / 8) {
+            fprintf(stderr, "ERROR: Invalid raster page header (%ux%u pixels, "
+                    "%ux%u dpi, %u bytes per line)\n", h.cupsWidth, h.cupsHeight,
+                    xres, yres, h.cupsBytesPerLine);
+            status = 1;
+            break;
+        }
 
         page++;
         fprintf(stderr, "INFO: Processing page %d\n", page);
@@ -210,22 +316,23 @@ int main(int argc, char *argv[])
          * printer expects a bitmap of the whole sheet (as Ghostscript's
          * pbmraw device produced for the old filter). Place the raster on a
          * full-page canvas at the position of the imageable area. */
-        unsigned xres = h.HWResolution[0] ? h.HWResolution[0] : 600;
-        unsigned yres = h.HWResolution[1] ? h.HWResolution[1] : 600;
-        unsigned page_w = (unsigned)(h.PageSize[0] * xres / 72.0 + 0.5);
-        unsigned page_h = (unsigned)(h.PageSize[1] * yres / 72.0 + 0.5);
-        unsigned ox = (unsigned)(h.ImagingBoundingBox[0] * xres / 72.0 + 0.5);
-        unsigned oy = h.PageSize[1] > h.ImagingBoundingBox[3] && h.ImagingBoundingBox[3]
-                          ? (unsigned)((h.PageSize[1] - h.ImagingBoundingBox[3]) * yres / 72.0 + 0.5)
-                          : 0;
-        if (page_w < h.cupsWidth || page_h < h.cupsHeight) {
-            page_w = h.cupsWidth;
-            page_h = h.cupsHeight;
+        /* All arithmetic in double: header fields are 32-bit and would
+         * overflow when multiplied by the resolution. */
+        unsigned page_w = h.cupsWidth, page_h = h.cupsHeight, ox = 0, oy = 0;
+        if (h.PageSize[0] <= MAX_PAGE_PT && h.PageSize[1] <= MAX_PAGE_PT) {
+            double pw = h.PageSize[0] * (double)xres / 72.0 + 0.5;
+            double ph = h.PageSize[1] * (double)yres / 72.0 + 0.5;
+            if (pw >= h.cupsWidth && ph >= h.cupsHeight) {
+                page_w = (unsigned)pw;
+                page_h = (unsigned)ph;
+            }
         }
-        if (ox + h.cupsWidth > page_w)
-            ox = page_w - h.cupsWidth;
-        if (oy + h.cupsHeight > page_h)
-            oy = page_h - h.cupsHeight;
+        double fx = h.ImagingBoundingBox[0] * (double)xres / 72.0 + 0.5;
+        double fy = h.ImagingBoundingBox[3] && h.ImagingBoundingBox[3] < h.PageSize[1]
+                        ? ((double)h.PageSize[1] - h.ImagingBoundingBox[3]) * yres / 72.0 + 0.5
+                        : 0.0;
+        ox = fx > page_w - h.cupsWidth ? page_w - h.cupsWidth : (unsigned)fx;
+        oy = fy > page_h - h.cupsHeight ? page_h - h.cupsHeight : (unsigned)fy;
 
         size_t bpl = (page_w + 7) / 8;
         size_t size = bpl * page_h;
@@ -247,11 +354,20 @@ int main(int argc, char *argv[])
             }
             row_cap = h.cupsBytesPerLine;
         }
+        size_t src_bytes = (h.cupsWidth + 7) / 8;
+        if (gray && src_bytes > bits_cap) {
+            free(bits);
+            if (!(bits = malloc(src_bytes))) {
+                fputs("ERROR: Out of memory for raster line\n", stderr);
+                status = 1;
+                break;
+            }
+            bits_cap = src_bytes;
+        }
         memset(bitmap, 0, size);
 
         int invert = h.cupsColorSpace == CUPS_CSPACE_W ||
                      h.cupsColorSpace == CUPS_CSPACE_SW;
-        size_t src_bytes = (h.cupsWidth + 7) / 8;
         unsigned char tail_mask = h.cupsWidth % 8 ? (unsigned char)(0xff << (8 - h.cupsWidth % 8))
                                                   : 0xff;
         unsigned shift = ox % 8;
@@ -261,19 +377,25 @@ int main(int argc, char *argv[])
              * here on) so the printer is not left in the middle of a job. */
             if (cupsRasterReadPixels(ras, row, h.cupsBytesPerLine) == 0)
                 break;
-            if (invert)
+            unsigned char *src = row;
+            if (gray) {
+                halftone_row(row, h.cupsWidth, h.cupsColorSpace == CUPS_CSPACE_K,
+                             ox, oy + y, bits);
+                src = bits;
+            } else if (invert) {
                 for (size_t i = 0; i < src_bytes; i++)
                     row[i] = (unsigned char)~row[i];
-            row[src_bytes - 1] &= tail_mask;
+            }
+            src[src_bytes - 1] &= tail_mask;
 
             unsigned char *dst = bitmap + (size_t)(oy + y) * bpl + ox / 8;
             if (shift == 0) {
-                memcpy(dst, row, src_bytes);
+                memcpy(dst, src, src_bytes);
             } else {
                 for (size_t i = 0; i < src_bytes; i++) {
-                    dst[i] |= (unsigned char)(row[i] >> shift);
+                    dst[i] |= (unsigned char)(src[i] >> shift);
                     if (ox / 8 + i + 1 < bpl)
-                        dst[i + 1] |= (unsigned char)(row[i] << (8 - shift));
+                        dst[i + 1] |= (unsigned char)(src[i] << (8 - shift));
                 }
             }
         }
@@ -342,6 +464,7 @@ int main(int argc, char *argv[])
     cupsFreeOptions(num_options, options);
     free(bitmap);
     free(row);
+    free(bits);
     free(jbig.data);
     if (fd)
         close(fd);

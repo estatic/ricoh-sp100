@@ -78,5 +78,11 @@
 *DefaultResolution: 600dpi
 *Resolution 600dpi/600 DPI: "<</HWResolution[600 600]/cupsBitsPerColor 1/cupsRowCount 0/cupsRowFeed 0/cupsRowStep 0/cupsColorSpace 3>>setpagedevice"
 *CloseUI: *Resolution
+*OpenUI *Halftone/Halftone: PickOne
+*OrderDependency: 20 AnySetup *Halftone
+*DefaultHalftone: Standard
+*Halftone Standard/Standard (text, line art): "<</cupsBitsPerColor 1/cupsColorSpace 3>>setpagedevice"
+*Halftone Photo/Photo (smooth grays): "<</cupsBitsPerColor 8/cupsColorSpace 0>>setpagedevice"
+*CloseUI: *Halftone
 *DefaultFont: Courier
-*% End of rsp111.ppd, 03559 bytes.
+*% End of rsp111.ppd, 03878 bytes.

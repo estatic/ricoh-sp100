@@ -13,10 +13,10 @@ PPDS   := $(MODELS:%=ppd/%.ppd)
 all: rastertoricohddst ppds
 
 rastertoricohddst: src/rastertoricohddst.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(LDFLAGS) $(CUPS_LIBS) -ljbig
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(LDFLAGS) $(CUPS_LIBS) -ljbig -lm
 
 ddst-check: tools/ddst-check.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(LDFLAGS) -ljbig
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(LDFLAGS) -ljbig -lm
 
 # PPDs are generated from the driver information file by CUPS' ppdc.
 ppds: $(PPDS)

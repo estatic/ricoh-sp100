@@ -32,6 +32,15 @@ MediaSize EnvMonarch
 
 *Resolution k 1 0 0 0 "600dpi/600 DPI"
 
+// Standard: Ghostscript renders 1-bit black directly (best for text).
+// Photo: Ghostscript renders 8-bit gray and the filter applies a
+// clustered-dot screen with dot-gain compensation (smoother grays/photos).
+// Ordered after Resolution so it can override the bit depth.
+Group "General/General"
+  Option "Halftone/Halftone" PickOne AnySetup 20
+    *Choice "Standard/Standard (text, line art)" "<</cupsBitsPerColor 1/cupsColorSpace 3>>setpagedevice"
+    Choice "Photo/Photo (smooth grays)" "<</cupsBitsPerColor 8/cupsColorSpace 0>>setpagedevice"
+
 {
   ModelName "SP 100"
   Attribute NickName "" "Ricoh SP 100, rastertoricohddst 2.0"

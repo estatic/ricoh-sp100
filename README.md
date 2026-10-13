@@ -83,6 +83,21 @@ printer settings, and pick *Ricoh SP 111SU, rastertoricohddst 2.0*.
 
 To uninstall: `sudo make uninstall`.
 
+## Print options
+
+* **Media Size**: A4, A5, A6, Letter, Legal, JIS B5/B6, Envelope Monarch.
+* **Halftone**:
+  * *Standard* (default): Ghostscript renders black and white directly.
+    Best for text and line art.
+  * *Photo*: Ghostscript renders 8-bit gray, and the filter converts it with
+    a clustered-dot screen (85 lpi, 45°) plus a tone curve that offsets
+    toner spread. Grays and photos come out smoother, and dark shades stay
+    distinguishable. Text is identical in both modes.
+
+  Pick it in the print dialog, or on the command line:
+  `lp -o Halftone=Photo file.pdf`. To make it the default for the queue:
+  `lpoptions -p RICOH_SP_111SU_DDST -o Halftone=Photo`.
+
 ## Troubleshooting
 
 * Filter messages are in CUPS' log: `journalctl -u cups` or
